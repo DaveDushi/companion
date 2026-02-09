@@ -53,6 +53,8 @@ function makeDefaultState(sessionId: string): SessionState {
     claude_code_version: "",
     mcp_servers: [],
     agents: [],
+    slash_commands: [],
+    skills: [],
     total_cost_usd: 0,
     num_turns: 0,
     context_used_percent: 0,
@@ -294,6 +296,8 @@ export class WsBridge {
       session.state.claude_code_version = init.claude_code_version;
       session.state.mcp_servers = init.mcp_servers;
       session.state.agents = init.agents ?? [];
+      session.state.slash_commands = init.slash_commands ?? [];
+      session.state.skills = init.skills ?? [];
 
       this.broadcastToBrowsers(session, {
         type: "session_init",

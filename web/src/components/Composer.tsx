@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { useStore } from "../store.js";
 import { sendToSession } from "../ws.js";
 
@@ -23,11 +23,19 @@ function readFileAsBase64(file: File): Promise<{ base64: string; mediaType: stri
   });
 }
 
+interface CommandItem {
+  name: string;
+  type: "command" | "skill";
+}
+
 export function Composer({ sessionId }: { sessionId: string }) {
   const [text, setText] = useState("");
   const [images, setImages] = useState<ImageAttachment[]>([]);
+  const [slashMenuOpen, setSlashMenuOpen] = useState(false);
+  const [slashMenuIndex, setSlashMenuIndex] = useState(0);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
   const cliConnected = useStore((s) => s.cliConnected);
   const sessionData = useStore((s) => s.sessions.get(sessionId));
   const previousMode = useStore((s) => s.previousPermissionMode.get(sessionId) || "acceptEdits");
@@ -35,6 +43,67 @@ export function Composer({ sessionId }: { sessionId: string }) {
   const isConnected = cliConnected.get(sessionId) ?? false;
   const currentMode = sessionData?.permissionMode || "acceptEdits";
   const isPlan = currentMode === "plan";
+
+  // Build command list from session data
+  const allCommands = useMemo<CommandItem[]>(() => {
+    const cmds: CommandItem[] = [];
+    if (sessionData?.slash_commands) {
+      for (const cmd of sessionData.slash_commands) {
+        cmds.push({ name: cmd, type: "command" });
+      }
+    }
+    if (sessionData?.skills) {
+      for (const skill of sessionData.skills) {
+        cmds.push({ name: skill, type: "skill" });
+      }
+    }
+    return cmds;
+  }, [sessionData?.slash_commands, sessionData?.skills]);
+
+  // Filter commands based on what the user typed after /
+  const filteredCommands = useMemo(() => {
+    if (!slashMenuOpen) return [];
+    // Extract the slash query: text starts with / and we match the part after /
+    const match = text.match(/^\/(\S*)$/);
+    if (!match) return [];
+    const query = match[1].toLowerCase();
+    if (query === "") return allCommands;
+    return allCommands.filter((cmd) => cmd.name.toLowerCase().includes(query));
+  }, [text, slashMenuOpen, allCommands]);
+
+  // Open/close menu based on text
+  useEffect(() => {
+    const shouldOpen = text.startsWith("/") && /^\/\S*$/.test(text) && allCommands.length > 0;
+    if (shouldOpen && !slashMenuOpen) {
+      setSlashMenuOpen(true);
+      setSlashMenuIndex(0);
+    } else if (!shouldOpen && slashMenuOpen) {
+      setSlashMenuOpen(false);
+    }
+  }, [text, allCommands.length, slashMenuOpen]);
+
+  // Keep selected index in bounds
+  useEffect(() => {
+    if (slashMenuIndex >= filteredCommands.length) {
+      setSlashMenuIndex(Math.max(0, filteredCommands.length - 1));
+    }
+  }, [filteredCommands.length, slashMenuIndex]);
+
+  // Scroll selected item into view
+  useEffect(() => {
+    if (!menuRef.current || !slashMenuOpen) return;
+    const items = menuRef.current.querySelectorAll("[data-cmd-index]");
+    const selected = items[slashMenuIndex];
+    if (selected) {
+      selected.scrollIntoView({ block: "nearest" });
+    }
+  }, [slashMenuIndex, slashMenuOpen]);
+
+  const selectCommand = useCallback((cmd: CommandItem) => {
+    setText(`/${cmd.name} `);
+    setSlashMenuOpen(false);
+    textareaRef.current?.focus();
+  }, []);
 
   function handleSend() {
     const msg = text.trim();
@@ -56,6 +125,7 @@ export function Composer({ sessionId }: { sessionId: string }) {
 
     setText("");
     setImages([]);
+    setSlashMenuOpen(false);
 
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
@@ -64,6 +134,35 @@ export function Composer({ sessionId }: { sessionId: string }) {
   }
 
   function handleKeyDown(e: React.KeyboardEvent) {
+    // Slash menu navigation
+    if (slashMenuOpen && filteredCommands.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setSlashMenuIndex((i) => (i + 1) % filteredCommands.length);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setSlashMenuIndex((i) => (i - 1 + filteredCommands.length) % filteredCommands.length);
+        return;
+      }
+      if (e.key === "Tab" && !e.shiftKey) {
+        e.preventDefault();
+        selectCommand(filteredCommands[slashMenuIndex]);
+        return;
+      }
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        selectCommand(filteredCommands[slashMenuIndex]);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setSlashMenuOpen(false);
+        return;
+      }
+    }
+
     if (e.key === "Tab" && e.shiftKey) {
       e.preventDefault();
       toggleMode();
@@ -175,18 +274,55 @@ export function Composer({ sessionId }: { sessionId: string }) {
         />
 
         {/* Unified input card */}
-        <div className={`bg-cc-input-bg border rounded-[14px] overflow-hidden transition-colors ${
+        <div className={`relative bg-cc-input-bg border rounded-[14px] overflow-visible transition-colors ${
           isPlan
             ? "border-cc-primary/40"
             : "border-cc-border focus-within:border-cc-primary/30"
         }`}>
+          {/* Slash command menu */}
+          {slashMenuOpen && filteredCommands.length > 0 && (
+            <div
+              ref={menuRef}
+              className="absolute left-2 right-2 bottom-full mb-1 max-h-[240px] overflow-y-auto bg-cc-card border border-cc-border rounded-[10px] shadow-lg z-20 py-1"
+            >
+              {filteredCommands.map((cmd, i) => (
+                <button
+                  key={`${cmd.type}-${cmd.name}`}
+                  data-cmd-index={i}
+                  onClick={() => selectCommand(cmd)}
+                  className={`w-full px-3 py-2 text-left flex items-center gap-2.5 transition-colors cursor-pointer ${
+                    i === slashMenuIndex
+                      ? "bg-cc-hover"
+                      : "hover:bg-cc-hover/50"
+                  }`}
+                >
+                  <span className="flex items-center justify-center w-6 h-6 rounded-md bg-cc-hover text-cc-muted shrink-0">
+                    {cmd.type === "skill" ? (
+                      <svg viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5">
+                        <path d="M8 1l1.796 3.64L14 5.255l-3 2.924.708 4.126L8 10.5l-3.708 1.805L5 8.18 2 5.255l4.204-.615L8 1z" />
+                      </svg>
+                    ) : (
+                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-3.5 h-3.5">
+                        <path d="M5 12L10 4" strokeLinecap="round" />
+                      </svg>
+                    )}
+                  </span>
+                  <div className="flex-1 min-w-0">
+                    <span className="text-[13px] font-medium text-cc-fg">/{cmd.name}</span>
+                    <span className="ml-2 text-[11px] text-cc-muted">{cmd.type}</span>
+                  </div>
+                </button>
+              ))}
+            </div>
+          )}
+
           <textarea
             ref={textareaRef}
             value={text}
             onChange={handleInput}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
-            placeholder={isConnected ? "Type a message..." : "Waiting for CLI connection..."}
+            placeholder={isConnected ? "Type a message... (/ for commands)" : "Waiting for CLI connection..."}
             disabled={!isConnected}
             rows={1}
             className="w-full px-4 pt-3 pb-1 text-sm bg-transparent resize-none focus:outline-none text-cc-fg font-sans-ui placeholder:text-cc-muted disabled:opacity-50"
@@ -209,13 +345,11 @@ export function Composer({ sessionId }: { sessionId: string }) {
               title="Toggle mode (Shift+Tab)"
             >
               {isPlan ? (
-                /* Pause bars icon */
                 <svg viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5">
                   <rect x="3" y="3" width="3.5" height="10" rx="0.75" />
                   <rect x="9.5" y="3" width="3.5" height="10" rx="0.75" />
                 </svg>
               ) : (
-                /* Double chevron icon */
                 <svg viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5">
                   <path d="M2.5 4l4 4-4 4" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" fill="none" />
                   <path d="M8.5 4l4 4-4 4" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" fill="none" />

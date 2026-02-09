@@ -195,6 +195,8 @@ export interface SessionState {
   claude_code_version: string;
   mcp_servers: { name: string; status: string }[];
   agents: string[];
+  slash_commands: string[];
+  skills: string[];
   total_cost_usd: number;
   num_turns: number;
   context_used_percent: number;
