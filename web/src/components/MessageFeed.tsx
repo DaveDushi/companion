@@ -8,16 +8,27 @@ const EMPTY_MESSAGES: ChatMessage[] = [];
 
 // ─── Message-level grouping ─────────────────────────────────────────────────
 
+interface ToolItem { id: string; name: string; input: Record<string, unknown> }
+
 interface ToolMsgGroup {
   kind: "tool_msg_group";
   toolName: string;
-  items: { id: string; name: string; input: Record<string, unknown> }[];
+  items: ToolItem[];
   firstId: string;
+}
+
+interface SubagentGroup {
+  kind: "subagent";
+  taskToolUseId: string;
+  description: string;
+  agentType: string;
+  children: FeedEntry[];
 }
 
 type FeedEntry =
   | { kind: "message"; msg: ChatMessage }
-  | ToolMsgGroup;
+  | ToolMsgGroup
+  | SubagentGroup;
 
 /**
  * Get the dominant tool name if this message is "tool-only"
@@ -41,14 +52,29 @@ function getToolOnlyName(msg: ChatMessage): string | null {
   return toolName;
 }
 
-function extractToolItems(msg: ChatMessage): { id: string; name: string; input: Record<string, unknown> }[] {
+function extractToolItems(msg: ChatMessage): ToolItem[] {
   const blocks = msg.contentBlocks || [];
   return blocks
     .filter((b): b is ContentBlock & { type: "tool_use"; id: string; name: string; input: Record<string, unknown> } => b.type === "tool_use")
     .map((b) => ({ id: b.id, name: b.name, input: b.input }));
 }
 
-function groupMessages(messages: ChatMessage[]): FeedEntry[] {
+/** Get Task tool_use IDs from a feed entry */
+function getTaskIdsFromEntry(entry: FeedEntry): string[] {
+  if (entry.kind === "message") {
+    const blocks = entry.msg.contentBlocks || [];
+    return blocks
+      .filter(b => b.type === "tool_use" && (b as { name?: string }).name === "Task")
+      .map(b => (b as { id: string }).id);
+  }
+  if (entry.kind === "tool_msg_group" && entry.toolName === "Task") {
+    return entry.items.map(item => item.id);
+  }
+  return [];
+}
+
+/** Group consecutive same-tool messages */
+function groupToolMessages(messages: ChatMessage[]): FeedEntry[] {
   const entries: FeedEntry[] = [];
 
   for (const msg of messages) {
@@ -60,7 +86,6 @@ function groupMessages(messages: ChatMessage[]): FeedEntry[] {
         last.items.push(...extractToolItems(msg));
         continue;
       }
-      // Start new group
       entries.push({
         kind: "tool_msg_group",
         toolName,
@@ -73,6 +98,79 @@ function groupMessages(messages: ChatMessage[]): FeedEntry[] {
   }
 
   return entries;
+}
+
+/** Build feed entries with subagent nesting */
+function buildEntries(
+  messages: ChatMessage[],
+  taskInfo: Map<string, { description: string; agentType: string }>,
+  childrenByParent: Map<string, ChatMessage[]>,
+): FeedEntry[] {
+  const grouped = groupToolMessages(messages);
+
+  const result: FeedEntry[] = [];
+  for (const entry of grouped) {
+    result.push(entry);
+
+    // After each entry containing Task tool_use(s), insert subagent groups
+    const taskIds = getTaskIdsFromEntry(entry);
+    for (const taskId of taskIds) {
+      const children = childrenByParent.get(taskId);
+      if (children && children.length > 0) {
+        const info = taskInfo.get(taskId) || { description: "Subagent", agentType: "" };
+        const childEntries = buildEntries(children, taskInfo, childrenByParent);
+        result.push({
+          kind: "subagent",
+          taskToolUseId: taskId,
+          description: info.description,
+          agentType: info.agentType,
+          children: childEntries,
+        });
+      }
+    }
+  }
+
+  return result;
+}
+
+function groupMessages(messages: ChatMessage[]): FeedEntry[] {
+  // Phase 1: Find all Task tool_use IDs across all messages
+  const taskInfo = new Map<string, { description: string; agentType: string }>();
+  for (const msg of messages) {
+    if (!msg.contentBlocks) continue;
+    for (const b of msg.contentBlocks) {
+      if (b.type === "tool_use" && (b as { name?: string }).name === "Task") {
+        const input = (b as { id: string; input: Record<string, unknown> }).input;
+        const id = (b as { id: string }).id;
+        taskInfo.set(id, {
+          description: String(input?.description || "Subagent"),
+          agentType: String(input?.subagent_type || ""),
+        });
+      }
+    }
+  }
+
+  // If no Task tool_uses found, skip the overhead
+  if (taskInfo.size === 0) {
+    return groupToolMessages(messages);
+  }
+
+  // Phase 2: Partition into top-level and child messages
+  const childrenByParent = new Map<string, ChatMessage[]>();
+  const topLevel: ChatMessage[] = [];
+
+  for (const msg of messages) {
+    if (msg.parentToolUseId && taskInfo.has(msg.parentToolUseId)) {
+      let arr = childrenByParent.get(msg.parentToolUseId);
+      if (!arr) { arr = []; childrenByParent.set(msg.parentToolUseId, arr); }
+      arr.push(msg);
+    } else {
+      topLevel.push(msg);
+    }
+  }
+
+  // Phase 3: Build grouped entries with subagent nesting
+  return buildEntries(topLevel, taskInfo, childrenByParent);
 }
 
 // ─── Components ──────────────────────────────────────────────────────────────
@@ -160,6 +258,59 @@ function ToolMessageGroup({ group }: { group: ToolMsgGroup }) {
   );
 }
 
+function FeedEntries({ entries }: { entries: FeedEntry[] }) {
+  return (
+    <>
+      {entries.map((entry, i) => {
+        if (entry.kind === "tool_msg_group") {
+          return <ToolMessageGroup key={entry.firstId || i} group={entry} />;
+        }
+        if (entry.kind === "subagent") {
+          return <SubagentContainer key={entry.taskToolUseId} group={entry} />;
+        }
+        return <MessageBubble key={entry.msg.id} message={entry.msg} />;
+      })}
+    </>
+  );
+}
+
+function SubagentContainer({ group }: { group: SubagentGroup }) {
+  const [open, setOpen] = useState(true);
+  const label = group.description || "Subagent";
+  const agentType = group.agentType;
+
+  return (
+    <div className="animate-[fadeSlideIn_0.2s_ease-out]">
+      <div className="ml-9 border-l-2 border-cc-primary/20 pl-4">
+        <button
+          onClick={() => setOpen(!open)}
+          className="flex items-center gap-2 py-1.5 text-left cursor-pointer group mb-2"
+        >
+          <svg viewBox="0 0 16 16" fill="currentColor" className={`w-3 h-3 text-cc-muted transition-transform shrink-0 ${open ? "rotate-90" : ""}`}>
+            <path d="M6 4l4 4-4 4" />
+          </svg>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-3.5 h-3.5 text-cc-primary shrink-0">
+            <circle cx="8" cy="8" r="5" />
+            <path d="M8 5v3l2 1" strokeLinecap="round" />
+          </svg>
+          <span className="text-xs font-medium text-cc-fg">{label}</span>
+          {agentType && (
+            <span className="text-[10px] text-cc-muted bg-cc-hover rounded-full px-1.5 py-0.5">
+              {agentType}
+            </span>
+          )}
+        </button>
+
+        {open && (
+          <div className="space-y-3">
+            <FeedEntries entries={group.children} />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function AssistantAvatar() {
   return (
     <div className="w-6 h-6 rounded-full bg-cc-primary/10 flex items-center justify-center shrink-0 mt-0.5">
@@ -221,12 +372,7 @@ export function MessageFeed({ sessionId }: { sessionId: string }) {
         className="h-full overflow-y-auto scroll-smooth px-4 py-6"
       >
         <div className="max-w-3xl mx-auto space-y-5">
-          {grouped.map((entry, i) => {
-            if (entry.kind === "tool_msg_group") {
-              return <ToolMessageGroup key={entry.firstId || i} group={entry} />;
-            }
-            return <MessageBubble key={entry.msg.id} message={entry.msg} />;
-          })}
+          <FeedEntries entries={grouped} />
 
           {/* Streaming indicator */}
           {streamingText && (
