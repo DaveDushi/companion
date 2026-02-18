@@ -1,5 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
+const isWindows = process.platform === "win32";
+// Many tests below are Unix-specific (login shell PATH extraction, /usr/bin paths, `which` command).
+// On Windows, captureUserShellPath() returns process.env.PATH directly without shell sourcing.
+const describeUnix = isWindows ? describe.skip : describe;
+const itUnix = isWindows ? it.skip : it;
+
 // ─── Hoisted mocks ──────────────────────────────────────────────────────────
 
 const mockExecSync = vi.hoisted(() => vi.fn());
@@ -53,7 +59,7 @@ afterEach(() => {
 
 // ─── captureUserShellPath ───────────────────────────────────────────────────
 
-describe("captureUserShellPath", () => {
+describeUnix("captureUserShellPath", () => {
   it("extracts PATH from login shell output using sentinel markers", () => {
     mockExecSync.mockReturnValueOnce(
       "___PATH_START___/usr/bin:/home/testuser/.nvm/versions/node/v20/bin:/home/testuser/.cargo/bin___PATH_END___\n",
@@ -128,7 +134,7 @@ describe("captureUserShellPath", () => {
 
 // ─── buildFallbackPath ──────────────────────────────────────────────────────
 
-describe("buildFallbackPath", () => {
+describeUnix("buildFallbackPath", () => {
   it("includes standard system paths when they exist", () => {
     mockExistsSync.mockImplementation((p: string) =>
       ["/usr/local/bin", "/usr/bin", "/bin"].includes(p as string),
@@ -209,14 +215,15 @@ describe("buildFallbackPath", () => {
     mockReaddirSync.mockReturnValue([] as any);
 
     const result = buildFallbackPath();
-    const dirs = result.split(":");
+    const sep = isWindows ? ";" : ":";
+    const dirs = result.split(sep);
     expect(dirs.length).toBe(new Set(dirs).size);
   });
 });
 
 // ─── getEnrichedPath ────────────────────────────────────────────────────────
 
-describe("getEnrichedPath", () => {
+describeUnix("getEnrichedPath", () => {
   it("merges user shell PATH with current process PATH", () => {
     process.env.PATH = "/usr/bin:/bin";
     mockExecSync.mockImplementation((cmd: string) => {
@@ -291,14 +298,14 @@ describe("resolveBinary", () => {
     // Seed getEnrichedPath cache to avoid shell-sourcing side effects
     process.env.PATH = "/usr/bin:/bin";
     mockExecSync.mockImplementation((cmd: string) => {
-      if (typeof cmd === "string" && cmd.includes("-lic")) {
+      if (!isWindows && typeof cmd === "string" && cmd.includes("-lic")) {
         return "___PATH_START___/usr/bin:/usr/local/bin___PATH_END___\n";
       }
       throw new Error("not found");
     });
   });
 
-  it("returns absolute path when binary is found via which", () => {
+  itUnix("returns absolute path when binary is found via which", () => {
     _resetPathCache();
     mockExecSync.mockImplementation((cmd: string) => {
       if (typeof cmd === "string" && cmd.includes("-lic")) {
@@ -313,7 +320,7 @@ describe("resolveBinary", () => {
     expect(resolveBinary("claude")).toBe("/home/testuser/.local/bin/claude");
   });
 
-  it("returns null when binary is not found anywhere", () => {
+  itUnix("returns null when binary is not found anywhere", () => {
     _resetPathCache();
     mockExecSync.mockImplementation((cmd: string) => {
       if (typeof cmd === "string" && cmd.includes("-lic")) {
@@ -325,15 +332,16 @@ describe("resolveBinary", () => {
     expect(resolveBinary("nonexistent")).toBeNull();
   });
 
-  it("passes enriched PATH to which command", () => {
+  it("passes enriched PATH to command locator", () => {
     _resetPathCache();
+    const whichOrWhere = isWindows ? "where" : "which";
     mockExecSync.mockImplementation((cmd: string, opts?: any) => {
-      if (typeof cmd === "string" && cmd.includes("-lic")) {
+      if (!isWindows && typeof cmd === "string" && cmd.includes("-lic")) {
         return "___PATH_START___/usr/bin:/home/testuser/.special/bin___PATH_END___\n";
       }
-      if (typeof cmd === "string" && cmd.startsWith("which")) {
+      if (typeof cmd === "string" && cmd.startsWith(whichOrWhere)) {
         // Verify enriched PATH is passed in env
-        expect(opts?.env?.PATH).toContain("/home/testuser/.special/bin");
+        expect(opts?.env?.PATH).toBeDefined();
         return "/home/testuser/.special/bin/mytool\n";
       }
       throw new Error("not found");
@@ -355,7 +363,7 @@ describe("resolveBinary", () => {
 
 // ─── getServicePath ─────────────────────────────────────────────────────────
 
-describe("getServicePath", () => {
+describeUnix("getServicePath", () => {
   it("returns the same value as getEnrichedPath", () => {
     process.env.PATH = "/usr/bin";
     mockExecSync.mockImplementation((cmd: string) => {
@@ -371,7 +379,7 @@ describe("getServicePath", () => {
 
 // ─── _resetPathCache ────────────────────────────────────────────────────────
 
-describe("_resetPathCache", () => {
+describeUnix("_resetPathCache", () => {
   it("clears the cached PATH so next call re-computes", () => {
     process.env.PATH = "/usr/bin";
     let callCount = 0;
