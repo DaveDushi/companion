@@ -11,7 +11,10 @@
 import { execSync } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
+
+const isWindows = process.platform === "win32";
+const PATH_SEP = isWindows ? ";" : ":";
 
 /**
  * Capture the user's full interactive shell PATH by spawning a login shell.
@@ -19,6 +22,12 @@ import { join } from "node:path";
  * Falls back to probing common directories if shell sourcing fails.
  */
 export function captureUserShellPath(): string {
+  // On Windows, process.env.PATH already contains the user's full PATH
+  // since Windows doesn't have the login-shell vs non-login-shell distinction.
+  if (isWindows) {
+    return process.env.PATH || "";
+  }
+
   try {
     const shell = process.env.SHELL || "/bin/bash";
     const captured = execSync(
@@ -46,57 +55,77 @@ export function captureUserShellPath(): string {
  */
 export function buildFallbackPath(): string {
   const home = homedir();
-  const candidates = [
-    // Standard system paths
-    "/opt/homebrew/bin",
-    "/opt/homebrew/sbin",
-    "/usr/local/bin",
-    "/usr/bin",
-    "/bin",
-    "/usr/sbin",
-    "/sbin",
-    // Bun
-    join(home, ".bun", "bin"),
-    // Claude CLI / user-local installs
-    join(home, ".local", "bin"),
-    // Cargo / Rust
-    join(home, ".cargo", "bin"),
-    // Volta (Node version manager)
-    join(home, ".volta", "bin"),
-    // mise (formerly rtx)
-    join(home, ".local", "share", "mise", "shims"),
-    // pyenv
-    join(home, ".pyenv", "bin"),
-    join(home, ".pyenv", "shims"),
-    // Go
-    join(home, "go", "bin"),
-    "/usr/local/go/bin",
-    // Deno
-    join(home, ".deno", "bin"),
-  ];
+  const candidates: string[] = [];
 
-  // Probe nvm-managed node versions
-  const nvmDir = process.env.NVM_DIR || join(home, ".nvm");
-  const nvmVersionsDir = join(nvmDir, "versions", "node");
-  if (existsSync(nvmVersionsDir)) {
-    try {
-      for (const v of readdirSync(nvmVersionsDir)) {
-        candidates.push(join(nvmVersionsDir, v, "bin"));
-      }
-    } catch { /* ignore */ }
+  if (isWindows) {
+    // Windows-specific paths
+    candidates.push(
+      // npm global installs
+      join(process.env.APPDATA || join(home, "AppData", "Roaming"), "npm"),
+      // Bun
+      join(home, ".bun", "bin"),
+      // Claude CLI / user-local installs
+      join(home, ".local", "bin"),
+      // Cargo / Rust
+      join(home, ".cargo", "bin"),
+      // Scoop
+      join(home, "scoop", "shims"),
+      // Volta
+      join(home, ".volta", "bin"),
+    );
+  } else {
+    candidates.push(
+      // Standard system paths
+      "/opt/homebrew/bin",
+      "/opt/homebrew/sbin",
+      "/usr/local/bin",
+      "/usr/bin",
+      "/bin",
+      "/usr/sbin",
+      "/sbin",
+      // Bun
+      join(home, ".bun", "bin"),
+      // Claude CLI / user-local installs
+      join(home, ".local", "bin"),
+      // Cargo / Rust
+      join(home, ".cargo", "bin"),
+      // Volta (Node version manager)
+      join(home, ".volta", "bin"),
+      // mise (formerly rtx)
+      join(home, ".local", "share", "mise", "shims"),
+      // pyenv
+      join(home, ".pyenv", "bin"),
+      join(home, ".pyenv", "shims"),
+      // Go
+      join(home, "go", "bin"),
+      "/usr/local/go/bin",
+      // Deno
+      join(home, ".deno", "bin"),
+    );
+
+    // Probe nvm-managed node versions
+    const nvmDir = process.env.NVM_DIR || join(home, ".nvm");
+    const nvmVersionsDir = join(nvmDir, "versions", "node");
+    if (existsSync(nvmVersionsDir)) {
+      try {
+        for (const v of readdirSync(nvmVersionsDir)) {
+          candidates.push(join(nvmVersionsDir, v, "bin"));
+        }
+      } catch { /* ignore */ }
+    }
+
+    // fnm (Fast Node Manager) — versions stored in fnm multishell or XDG data
+    const fnmDir = join(home, "Library", "Application Support", "fnm", "node-versions");
+    if (existsSync(fnmDir)) {
+      try {
+        for (const v of readdirSync(fnmDir)) {
+          candidates.push(join(fnmDir, v, "installation", "bin"));
+        }
+      } catch { /* ignore */ }
+    }
   }
 
-  // fnm (Fast Node Manager) — versions stored in fnm multishell or XDG data
-  const fnmDir = join(home, "Library", "Application Support", "fnm", "node-versions");
-  if (existsSync(fnmDir)) {
-    try {
-      for (const v of readdirSync(fnmDir)) {
-        candidates.push(join(fnmDir, v, "installation", "bin"));
-      }
-    } catch { /* ignore */ }
-  }
-
-  return [...new Set(candidates.filter((dir) => existsSync(dir)))].join(":");
+  return [...new Set(candidates.filter((dir) => existsSync(dir)))].join(PATH_SEP);
 }
 
 // ─── Enriched PATH (cached) ───────────────────────────────────────────────────
@@ -115,7 +144,7 @@ export function getEnrichedPath(): string {
   const userPath = captureUserShellPath();
 
   // Merge: user shell PATH first (takes precedence), then current process PATH
-  const allDirs = [...userPath.split(":"), ...currentPath.split(":")];
+  const allDirs = [...userPath.split(PATH_SEP), ...currentPath.split(PATH_SEP)];
   const seen = new Set<string>();
   const deduped: string[] = [];
   for (const dir of allDirs) {
@@ -125,7 +154,7 @@ export function getEnrichedPath(): string {
     }
   }
 
-  _cachedPath = deduped.join(":");
+  _cachedPath = deduped.join(PATH_SEP);
   return _cachedPath;
 }
 
@@ -139,21 +168,39 @@ export function _resetPathCache(): void {
 /**
  * Resolve a binary name to an absolute path using the enriched PATH.
  * Returns null if the binary is not found anywhere.
+ *
+ * On Windows, `where` can return multiple lines (e.g. extensionless shim,
+ * .cmd wrapper, .exe). We prefer .exe > .cmd since Bun.spawn cannot execute
+ * extensionless bash shims on Windows.
  */
 export function resolveBinary(name: string): string | null {
-  if (name.startsWith("/")) {
+  if (isAbsolute(name)) {
     return existsSync(name) ? name : null;
   }
 
   const enrichedPath = getEnrichedPath();
-  try {
-    const resolved = execSync(`which ${name.replace(/[^a-zA-Z0-9._@/-]/g, "")}`, {
+  const sanitized = name.replace(/[^a-zA-Z0-9._@/\\-]/g, "");
+  const cmd = isWindows ? `where ${sanitized}` : `which ${sanitized}`;
 
+  try {
+    const resolved = execSync(cmd, {
       encoding: "utf-8",
       timeout: 5_000,
       env: { ...process.env, PATH: enrichedPath },
     }).trim();
-    return resolved || null;
+
+    if (!resolved) return null;
+
+    if (!isWindows) {
+      return resolved.split(/\r?\n/)[0] || null;
+    }
+
+    // On Windows, prefer .exe > .cmd > first result
+    const lines = resolved.split(/\r?\n/).filter(Boolean);
+    return lines.find(l => l.endsWith(".exe"))
+      || lines.find(l => l.endsWith(".cmd"))
+      || lines[0]
+      || null;
   } catch {
     return null;
   }
